@@ -456,3 +456,71 @@ Train the *non-causal* controller offline (methods 1–3), then **distill** it i
 * You can’t alter the real past, but you can **recompute** it.
 * Non-causal AdaptiveRL is practical via **smoothing**, **hypergradients/adjoints**, or **receding-horizon checkpoint-and-rewrite**.
 * For production, **distill** the hindsight scheduler into a causal one.
+
+Short answer: yes. The tapes make next epoch smarter in two ways:
+
+1. **Hindsight → Better schedule now** (replay): use the tape to compute a non-causal (hindsight) schedule and replay from a checkpoint.
+2. **Prediction → Better schedule next epoch** (no replay): summarize the tape and *update the controller* before the next epoch starts.
+
+Here’s how to get concrete gains for the **next epoch** without any replay:
+
+# What to learn from the tape between epochs
+
+Compute epoch-level stats from the stepwise tape:
+
+* **Trend:** $\Delta \ell_e = \bar\ell_e-\bar\ell_{e-1}$, $\Delta r_e = \bar r_e-\bar r_{e-1}$
+* **Noise:** gradient RMS and variance of loss $v_e$
+* **Plateau score:** $P_e \in [0,1]$ (flat & low-variance)
+* **Generalization pulse (optional):** $\Delta\text{val}$ = change in val metric within the epoch
+
+# Next-epoch hyperparam update (safe, bounded)
+
+Use the same shaped laws you liked, but at **epoch granularity**:
+
+$$
+\begin{aligned}
+\tilde{\Delta r}_e &= \mathrm{clip}\Big(\frac{\Delta r_e}{S_r+\epsilon},-1,1\Big),\quad
+\tilde{\Delta \ell}_e = \mathrm{clip}\Big(\frac{\Delta \ell_e}{S_\ell+\epsilon},-1,1\Big) \\
+\log \alpha_{e+1} &= \log \alpha_e + k_r\,\tilde{\Delta r}_e - k_\ell\,\max(\tilde{\Delta \ell}_e,0) \\
+\mathrm{logit}(\mu_{e+1}) &= \mathrm{logit}(\mu_e) + k_{\mu r}\,\tilde{\Delta r}_e - k_{\mu \ell}\,\max(\tilde{\Delta \ell}_e,0) \\
+\log \sigma_{e+1} &= \log \sigma_e + k_{\sigma P}\,P_e - k_{\sigma r}\,\max(\tilde{\Delta r}_e,0)
+\end{aligned}
+$$
+
+Clip into bounds (e.g., $\alpha\in[1e{-}5,1e{-}1]$, $\mu\in[0.6,0.995]$, $\sigma\in[0,0.2]$) and optionally cap per-epoch change (e.g., $\times[0.8,1.25]$).
+
+Tiny pseudo-impl:
+
+```python
+def plan_next_epoch(stats, prev, gains, bounds):
+    dR = clip(stats.d_reward_norm, -1, 1)
+    dL = clip(stats.d_loss_norm, -1, 1)
+    P  = stats.plateau_score
+    a, m, s = prev.alpha, prev.mu, prev.sigma
+    # LR
+    a = clamp(exp(log(a) + gains.kr*dR - gains.kl*max(dL,0)), *bounds.alpha)
+    # Momentum
+    m_z = log(m/(1-m)) + gains.kmur*dR - gains.kmul*max(dL,0)
+    m = clamp(1/(1+exp(-m_z)), *bounds.mu)
+    # Exploration
+    s = clamp(exp(log(max(s,1e-12)) + gains.ksigP*P - gains.ksigR*max(dR,0)), *bounds.sigma)
+    return a, m, s
+```
+
+# Extra wins the tape unlocks (next epoch)
+
+* **Curriculum & sampling:** use per-example loss/grad stats to upsample “hard but learnable” items and downsample saturated ones (cap max upweighting to avoid overfitting).
+* **Augmentation schedule:** if $P_e$ high and $v_e$ low, increase augmentation strength next epoch; if val drops, relax it.
+* **Optimizer choice tweaks:** for AdamW, gently raise $\beta_1$ when $\tilde{\Delta r}_e>0$ and lower when $\tilde{\Delta \ell}_e>0$ (regime reset).
+* **RL knobs:** tapes of episode returns/advantages let you set **entropy coeff**, **clip-range**, or **GAE $\lambda$** for the next epoch: plateau ⇒ raise entropy/σ; improving returns ⇒ shrink entropy, modestly raise LR.
+* **Drift detection:** run a simple change-point test on $\ell$ or return; on drift, pre-emptively lower $\alpha$, lower $\mu$, raise $\sigma$ for the next epoch.
+
+# Guardrails (to really make it “better”)
+
+* Use **held-out validation** or fresh seeds to compute $\tilde{\Delta r}_e$ (prevents overfitting the next-epoch plan to the training tape).
+* Add a small **TV penalty** on the planned schedules between epochs to avoid thrashing.
+* Keep a **failsafe**: if val worsens two epochs in a row, revert to a conservative preset.
+
+# TL;DR
+
+Yes—tapes are fuel for both **hindsight** (replay) and **foresight** (next-epoch planning). Even without replay, summarizing the tape and applying the bounded update laws at **epoch scale** reliably nudges LR/momentum/noise in the right direction, improves time-to-target, and stabilizes training across regimes.
